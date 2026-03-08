@@ -116,6 +116,14 @@ pub async fn analyze_food(image_base64: String) -> Result<DietAnalysis, ServerFn
 // Server-side function for answering questions about the food image
 #[server]
 pub async fn ask_question(image_base64: String, question: String) -> Result<String, ServerFnError> {
+    // Validate inputs
+    if image_base64.is_empty() {
+        return Err(ServerFnError::new("Image is required to ask questions"));
+    }
+    if question.trim().is_empty() {
+        return Err(ServerFnError::new("Question cannot be empty"));
+    }
+    
     // Ensure .env file is loaded
     ensure_env_loaded();
     
@@ -181,4 +189,67 @@ pub async fn ask_question(image_base64: String, question: String) -> Result<Stri
         .ok_or_else(|| ServerFnError::new("No content in API response".to_string()))?;
 
     Ok(content.trim().to_string())
+}
+
+/// Transcribe audio via Groq (free) or OpenAI Whisper.
+/// Set GROQ_API_KEY in .env for free tier, or OPENAI_API_KEY for OpenAI.
+#[server]
+pub async fn transcribe_audio(audio_base64: String, mime_type: String) -> Result<String, ServerFnError> {
+    use base64::Engine as _;
+
+    ensure_env_loaded();
+
+    let (api_key, endpoint, model) =
+        if let Ok(k) = std::env::var("GROQ_API_KEY") {
+            (k, "https://api.groq.com/openai/v1/audio/transcriptions", "whisper-large-v3-turbo")
+        } else if let Ok(k) = std::env::var("OPENAI_API_KEY") {
+            (k, "https://api.openai.com/v1/audio/transcriptions", "whisper-1")
+        } else {
+            return Err(ServerFnError::new(
+                "Voice transcription requires GROQ_API_KEY (free) or OPENAI_API_KEY in .env"
+            ));
+        };
+
+    let audio_bytes = base64::engine::general_purpose::STANDARD
+        .decode(&audio_base64)
+        .map_err(|e| ServerFnError::new(format!("Failed to decode audio: {}", e)))?;
+
+    let ext = match mime_type.as_str() {
+        t if t.contains("mp4") || t.contains("m4a") => "m4a",
+        t if t.contains("webm") => "webm",
+        t if t.contains("ogg") => "ogg",
+        t if t.contains("wav") => "wav",
+        _ => "mp4",
+    };
+
+    let part = reqwest::multipart::Part::bytes(audio_bytes)
+        .file_name(format!("audio.{}", ext))
+        .mime_str(&mime_type)
+        .map_err(|e| ServerFnError::new(format!("Mime error: {}", e)))?;
+
+    let form = reqwest::multipart::Form::new()
+        .text("model", model)
+        .part("file", part);
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(endpoint)
+        .header("Authorization", format!("Bearer {}", api_key))
+        .multipart(form)
+        .send()
+        .await
+        .map_err(|e| ServerFnError::new(format!("Network error: {}", e)))?;
+
+    let status = response.status();
+    let text = response.text().await
+        .map_err(|e| ServerFnError::new(format!("Response error: {}", e)))?;
+
+    if !status.is_success() {
+        return Err(ServerFnError::new(format!("Transcription failed ({}): {}", status, text)));
+    }
+
+    let json: Value = serde_json::from_str(&text)
+        .map_err(|e| ServerFnError::new(format!("JSON error: {}", e)))?;
+
+    Ok(json["text"].as_str().unwrap_or("").trim().to_string())
 }

@@ -7,7 +7,10 @@ use dioxus::prelude::*;
 use dioxus::html::HasFileData;
 use models::DietAnalysis;
 use base64::{engine::general_purpose, Engine as _};
+
+#[cfg(target_arch = "wasm32")]
 use wasm_bindgen::JsCast;
+#[cfg(target_arch = "wasm32")]
 use web_sys::HtmlInputElement;
 
 const MAIN_CSS: Asset = asset!("/assets/main.css");
@@ -27,6 +30,95 @@ enum MessageRole {
 
 const GENERIC_UI_ERROR: &str =
     "Something went wrong while contacting the assistant. Check your server config and try again.";
+
+fn escape_html(input: &str) -> String {
+    input
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn format_inline_markup(input: &str) -> String {
+    let escaped = escape_html(input);
+    let mut output = String::new();
+    let mut rest = escaped.as_str();
+    let mut strong = false;
+
+    while let Some(idx) = rest.find("**") {
+        output.push_str(&rest[..idx]);
+        output.push_str(if strong { "</strong>" } else { "<strong>" });
+        strong = !strong;
+        rest = &rest[idx + 2..];
+    }
+
+    output.push_str(rest);
+
+    if strong {
+        output.push_str("</strong>");
+    }
+
+    output
+}
+
+fn format_message_html(content: &str) -> String {
+    let mut html = String::new();
+    let mut paragraph_lines: Vec<String> = Vec::new();
+    let mut bullet_lines: Vec<String> = Vec::new();
+
+    let flush_paragraph = |html: &mut String, lines: &mut Vec<String>| {
+        if !lines.is_empty() {
+            let paragraph = lines.join(" ");
+            html.push_str("<p>");
+            html.push_str(&format_inline_markup(&paragraph));
+            html.push_str("</p>");
+            lines.clear();
+        }
+    };
+
+    let flush_bullets = |html: &mut String, bullets: &mut Vec<String>| {
+        if !bullets.is_empty() {
+            html.push_str("<ul>");
+            for bullet in bullets.iter() {
+                html.push_str("<li>");
+                html.push_str(&format_inline_markup(bullet));
+                html.push_str("</li>");
+            }
+            html.push_str("</ul>");
+            bullets.clear();
+        }
+    };
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+
+        if trimmed.is_empty() {
+            flush_paragraph(&mut html, &mut paragraph_lines);
+            flush_bullets(&mut html, &mut bullet_lines);
+            continue;
+        }
+
+        if let Some(bullet) = trimmed.strip_prefix("* ") {
+            flush_paragraph(&mut html, &mut paragraph_lines);
+            bullet_lines.push(bullet.to_string());
+            continue;
+        }
+
+        if !bullet_lines.is_empty() {
+            flush_bullets(&mut html, &mut bullet_lines);
+        }
+
+        paragraph_lines.push(trimmed.to_string());
+    }
+
+    flush_paragraph(&mut html, &mut paragraph_lines);
+    flush_bullets(&mut html, &mut bullet_lines);
+
+    if html.is_empty() {
+        "<p></p>".to_string()
+    } else {
+        html
+    }
+}
 
 fn format_analysis(analysis: &DietAnalysis) -> String {
     let tags = if analysis.dietary_tags.is_empty() {
@@ -67,6 +159,9 @@ fn format_analysis(analysis: &DietAnalysis) -> String {
     )
 }
 
+/// Max dimension (width or height) for resized images sent to the API.
+const MAX_IMAGE_DIM: u32 = 1024;
+
 fn load_file_into_chat(
     file: dioxus::html::FileData,
     mut image_base64: Signal<String>,
@@ -83,13 +178,41 @@ fn load_file_into_chat(
     spawn(async move {
         match file.read_bytes().await {
             Ok(bytes) => {
-                image_base64.set(general_purpose::STANDARD.encode(bytes));
-                messages.with_mut(|items| {
-                    items.push(ChatMessage {
-                        role: MessageRole::System,
-                        content: format!("Attached photo: {}", file_name),
+                #[cfg(target_arch = "wasm32")]
+                {
+                    match compress_image_bytes(&bytes).await {
+                        Ok(compressed_b64) => {
+                            image_base64.set(compressed_b64);
+                            messages.with_mut(|items| {
+                                items.push(ChatMessage {
+                                    role: MessageRole::System,
+                                    content: format!("Attached photo: {}", file_name),
+                                });
+                            });
+                        }
+                        Err(e) => {
+                            let text = format!("Failed to process image: {}", e);
+                            error.set(Some(text.clone()));
+                            messages.with_mut(|items| {
+                                items.push(ChatMessage {
+                                    role: MessageRole::System,
+                                    content: text,
+                                });
+                            });
+                        }
+                    }
+                }
+
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    image_base64.set(general_purpose::STANDARD.encode(&bytes));
+                    messages.with_mut(|items| {
+                        items.push(ChatMessage {
+                            role: MessageRole::System,
+                            content: format!("Attached photo: {}", file_name),
+                        });
                     });
-                });
+                }
             }
             Err(err) => {
                 let text = format!("Could not read the uploaded file: {}", err);
@@ -107,13 +230,94 @@ fn load_file_into_chat(
     });
 }
 
+/// Resize the image on the client via an OffscreenCanvas / <canvas> so the
+/// base64 payload stays well under the server body-size limit.
+#[cfg(target_arch = "wasm32")]
+async fn compress_image_bytes(raw: &[u8]) -> Result<String, String> {
+    use wasm_bindgen::JsCast;
+    use wasm_bindgen_futures::JsFuture;
+
+    let b64_src = general_purpose::STANDARD.encode(raw);
+    let data_url = format!("data:image/jpeg;base64,{}", b64_src);
+
+    let window = web_sys::window().ok_or("no window")?;
+    let document = window.document().ok_or("no document")?;
+
+    let img = document
+        .create_element("img")
+        .map_err(|_| "create_element failed")?
+        .dyn_into::<web_sys::HtmlImageElement>()
+        .map_err(|_| "dyn_into HtmlImageElement failed")?;
+
+    let (tx, rx) = futures_channel::oneshot::channel::<Result<(), String>>();
+    let tx = std::rc::Rc::new(std::cell::RefCell::new(Some(tx)));
+
+    let tx_ok = tx.clone();
+    let onload = wasm_bindgen::closure::Closure::wrap(Box::new(move || {
+        if let Some(sender) = tx_ok.borrow_mut().take() {
+            let _ = sender.send(Ok(()));
+        }
+    }) as Box<dyn FnMut()>);
+
+    let tx_err = tx.clone();
+    let onerror = wasm_bindgen::closure::Closure::wrap(Box::new(move || {
+        if let Some(sender) = tx_err.borrow_mut().take() {
+            let _ = sender.send(Err("image load error".to_string()));
+        }
+    }) as Box<dyn FnMut()>);
+
+    img.set_onload(Some(onload.as_ref().unchecked_ref()));
+    img.set_onerror(Some(onerror.as_ref().unchecked_ref()));
+    img.set_src(&data_url);
+
+    rx.await.map_err(|_| "channel cancelled")??;
+
+    let orig_w = img.natural_width();
+    let orig_h = img.natural_height();
+
+    let (w, h) = if orig_w > MAX_IMAGE_DIM || orig_h > MAX_IMAGE_DIM {
+        let scale = MAX_IMAGE_DIM as f64 / orig_w.max(orig_h) as f64;
+        ((orig_w as f64 * scale) as u32, (orig_h as f64 * scale) as u32)
+    } else {
+        (orig_w, orig_h)
+    };
+
+    let canvas = document
+        .create_element("canvas")
+        .map_err(|_| "create canvas failed")?
+        .dyn_into::<web_sys::HtmlCanvasElement>()
+        .map_err(|_| "dyn_into canvas failed")?;
+    canvas.set_width(w);
+    canvas.set_height(h);
+
+    let ctx = canvas
+        .get_context("2d")
+        .map_err(|_| "get_context failed")?
+        .ok_or("no 2d context")?
+        .dyn_into::<web_sys::CanvasRenderingContext2d>()
+        .map_err(|_| "dyn_into context failed")?;
+
+    ctx.draw_image_with_html_image_element_and_dw_and_dh(&img, 0.0, 0.0, w as f64, h as f64)
+        .map_err(|_| "draw_image failed")?;
+
+    let jpeg_data_url = canvas
+        .to_data_url_with_type_and_encoder_options("image/jpeg", &wasm_bindgen::JsValue::from_f64(0.75))
+        .map_err(|_| "to_data_url failed")?;
+
+    let b64 = jpeg_data_url
+        .find(',')
+        .map(|i| jpeg_data_url[i + 1..].to_string())
+        .ok_or("invalid data url")?;
+
+    Ok(b64)
+}
+
 fn main() {
     #[cfg(feature = "server")]
     {
-        // Load environment variables from .env file
         dotenvy::dotenv().ok();
     }
-    
+
     dioxus::launch(App);
 }
 
@@ -183,12 +387,12 @@ fn App() -> Element {
                     });
                 }
                 Err(e) => {
-                    let _ = e;
-                    error.set(Some(GENERIC_UI_ERROR.to_string()));
+                    let error_msg = e.to_string();
+                    error.set(Some(error_msg.clone()));
                     messages.with_mut(|items| {
                         items.push(ChatMessage {
                             role: MessageRole::System,
-                            content: GENERIC_UI_ERROR.to_string(),
+                            content: format!("Error: {}", error_msg),
                         });
                     });
                 }
@@ -210,11 +414,14 @@ fn App() -> Element {
     };
 
     let trigger_file_input = move |_| {
-        if let Some(window) = web_sys::window() {
-            if let Some(document) = window.document() {
-                if let Some(el) = document.get_element_by_id("food-file-input") {
-                    if let Ok(input) = el.dyn_into::<HtmlInputElement>() {
-                        input.click();
+        #[cfg(target_arch = "wasm32")]
+        {
+            if let Some(window) = web_sys::window() {
+                if let Some(document) = window.document() {
+                    if let Some(el) = document.get_element_by_id("food-file-input") {
+                        if let Ok(input) = el.dyn_into::<HtmlInputElement>() {
+                            input.click();
+                        }
                     }
                 }
             }
@@ -235,11 +442,11 @@ fn App() -> Element {
             r#type: "file",
             accept: "image/*",
             capture: "environment",
+            // "environment" = rear camera (best for food). Use "user" for front camera.
             onchange: on_file_change,
         }
         div { class: "app-container",
             div { class: "header",
-                div { class: "eyebrow", "Food Chat" }
                 h1 { "Diet Copilot" }
                 p { "One conversation thread for photo-based food questions." }
             }
@@ -299,7 +506,6 @@ fn App() -> Element {
                             p { class: "upload-dropzone-copy", "Drop a replacement here, or tap to choose another photo on iPhone." }
                         }
                         div { class: "toolbar-chip",
-                            span { class: "toolbar-chip-label", "Ready to analyze" }
                             button {
                                 class: "toolbar-chip-clear",
                                 onclick: move |evt| {
@@ -335,7 +541,10 @@ fn App() -> Element {
                                     MessageRole::System => "Status",
                                 }
                             }
-                            p { class: "message-body", "{message.content}" }
+                            div {
+                                class: "message-body",
+                                dangerous_inner_html: "{format_message_html(&message.content)}"
+                            }
                         }
                     }
                     if loading() {
@@ -364,7 +573,7 @@ fn App() -> Element {
                 }
             }
 
-          
+
         }
     }
 }
